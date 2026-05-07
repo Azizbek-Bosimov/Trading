@@ -1,106 +1,152 @@
 import asyncio
-import os
-import logging
-from flask import Flask
-from threading import Thread
 import ccxt
 import pandas as pd
 import ta
+import sys
+import os
+from flask import Flask
+from threading import Thread
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.constants import ParseMode
 
-# ==================== LOGGING ====================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ==================== RENDER UCHUN VEB-SERVER ====================
+# Render botni "Web Service" sifatida tanishi va o'chirib qo'ymasligi uchun kerak
+app_flask = Flask('')
 
-# ==================== SERVER (Render o'chmasligi uchun) ====================
-server = Flask('')
-@server.route('/')
-def home(): return "🤖 Bot is running..."
-def run(): server.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
-def keep_alive(): Thread(target=run, daemon=True).start()
+@app_flask.route('/')
+def home():
+    return "✅ Bot tirik va ishlamoqda!"
 
-# ==================== CONFIG ====================
-# Siz bergan yangi token:
-TOKEN = "8397450809:AAFtv0n6D1StMLmqeNb1EeKqHOnznVvcXpk"
-CHANNEL = "@fhoveuss"
+def run_flask():
+    # Render portni avtomat beradi, agar bo'lmasa 8080 ishlatadi
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host='0.0.0.0', port=port)
 
-# MEXC'da oltin formatlari har xil bo'lishi mumkin, hammasini tekshiramiz
-POSSIBLE_SYMBOLS = ["PAXG/USDT", "PAXGUSDT", "XAU_USDT"]
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
 
-exchange = ccxt.mexc({'enableRateLimit': True})
+# ==================== KONFIGURATSIYA ====================
+# Yangi tokenni ishlatamiz
+TELEGRAM_TOKEN = "8397450809:AAFtv0n6D1StMLmqeNb1EeKqHOnznVvcXpk"
+CHANNEL_ID     = "@fhoveuss" 
+SYMBOL         = "XAU/USDT" # MEXC va Bybit uchun universal format
+WAIT_TIME      = 60 # Juda tez so'rov yuborish bloklanishga olib keladi
 
-def get_data():
-    """Birjadan to'g'ri simvolni topib ma'lumot oladi"""
-    for sym in POSSIBLE_SYMBOLS:
-        try:
-            ohlcv = exchange.fetch_ohlcv(sym, "15m", limit=100)
-            if ohlcv:
-                df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
-                return df, sym
-        except Exception:
-            continue
-    return None, None
+# Renderda Bybit bloklangan bo'lsa MEXC ga o'zgartiring
+exchange = ccxt.mexc({'options': {'defaultType': 'spot'}, 'enableRateLimit': True})
+trade_log = {"active": False, "dir": None, "entry": 0, "tp": 0, "sl": 0}
 
+# ==================== 🧠 ELITE ANALIZ (SMC/ICT) ====================
+
+def find_fvg(df):
+    c1 = df.iloc[-3]
+    c3 = df.iloc[-1]
+    if c3['low'] > c1['high']:
+        return "BULLISH_FVG", (c1['high'] + c3['low']) / 2
+    if c3['high'] < c1['low']:
+        return "BEARISH_FVG", (c1['low'] + c3['high']) / 2
+    return None, 0
+
+def get_market_bias(df):
+    ema200 = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator().iloc[-1]
+    price = df.iloc[-1]['close']
+    return "BULLISH" if price > ema200 else "BEARISH"
+
+async def elite_analyser():
+    global trade_log
+    try:
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=150)
+        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        price = df.iloc[-1]['close']
+
+        if trade_log["active"]:
+            win = (trade_log["dir"] == "BUY" and price >= trade_log["tp"]) or \
+                  (trade_log["dir"] == "SELL" and price <= trade_log["tp"])
+            loss = (trade_log["dir"] == "BUY" and price <= trade_log["sl"]) or \
+                   (trade_log["dir"] == "SELL" and price >= trade_log["sl"])
+            
+            if win or loss:
+                res = "💎 PROFIT (TP) URILDI! 📈" if win else "🛑 STOP LOSS URILDI. 📉"
+                trade_log["active"] = False
+                return f"📊 *YOPILGAN SAVDO:* {SYMBOL}\n━━━━━━━━━━━━━━\nNatija: {res}\nNarx: `{price}`"
+
+        bias = get_market_bias(df)
+        fvg_type, fvg_price = find_fvg(df)
+        rsi = ta.momentum.RSIIndicator(df['close']).rsi().iloc[-1]
+        recent_high = df['high'].tail(15).max()
+        recent_low = df['low'].tail(15).min()
+        
+        confs = []
+        final_dir = None
+
+        if bias == "BULLISH":
+            if fvg_type == "BULLISH_FVG": confs.append("⚡️ Fair Value Gap")
+            if price > df['high'].iloc[-2]: confs.append("🏛 Structure Shift")
+            if rsi < 50: confs.append("📊 RSI Optimal")
+            if df['volume'].iloc[-1] > df['volume'].rolling(10).mean().iloc[-1] * 1.3: confs.append("🐋 Volume Spike")
+            if len(confs) >= 3: final_dir = "BUY"
+
+        if not final_dir and bias == "BEARISH":
+            if fvg_type == "BEARISH_FVG": confs.append("⚡️ Fair Value Gap")
+            if price < df['low'].iloc[-2]: confs.append("🏛 Structure Shift")
+            if rsi > 50: confs.append("📊 RSI Optimal")
+            if df['volume'].iloc[-1] > df['volume'].rolling(10).mean().iloc[-1] * 1.3: confs.append("🐋 Volume Spike")
+            if len(confs) >= 3: final_dir = "SELL"
+
+        if final_dir and not trade_log["active"]:
+            atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range().iloc[-1]
+            sl = round(recent_low - (atr * 0.5) if final_dir == "BUY" else recent_high + (atr * 0.5), 2)
+            tp = round(price + (abs(price - sl) * 3) if final_dir == "BUY" else price - (abs(price - sl) * 3), 2)
+            
+            trade_log.update({"active": True, "dir": final_dir, "entry": price, "tp": tp, "sl": sl})
+            
+            msg = (
+                f"🎩 *ELITE TREYDER ANALIZI: {SYMBOL}*\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"🔑 Signal: *{final_dir}*\n"
+                f"💎 Kirish: `{price}`\n"
+                f"🎯 Target (TP): `{tp}`\n"
+                f"🛡 Stop (SL): `{sl}`\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📝 *Asoslar:* {len(confs)}/4\n"
+                f"⚠️ *Risk/Reward:* 1:3.0"
+            )
+            return msg
+        return None
+    except Exception as e:
+        print(f"Xato: {e}")
+        return None
+
+# ==================== 📩 BOT BOSHQARUVI ====================
 async def loop(app):
-    logger.info("Tahlil boshlandi...")
+    print("Snayper Monitoring boshlandi...")
     while True:
         try:
-            df, active_symbol = get_data()
-            if df is not None:
-                close = df['c']
-                # Indikatorlar
-                rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
-                ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1]
-                ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
-                price = close.iloc[-1]
-                
-                # Signal shartlari (RSI + Trend)
-                signal_type = "WAIT"
-                if rsi < 38 and price > ema20: 
-                    signal_type = "BUY 🟢"
-                elif rsi > 62 and price < ema20: 
-                    signal_type = "SELL 🔴"
-                
-                if signal_type != "WAIT":
-                    msg = (
-                        f"🚀 *{active_symbol} SIGNAL*\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"💰 Narx: `{price}`\n"
-                        f"📊 RSI: `{rsi:.1f}`\n"
-                        f"⚡️ Signal: *{signal_type}*\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"⏱ Timeframe: 15m"
-                    )
-                    await app.bot.send_message(chat_id=CHANNEL, text=msg, parse_mode="Markdown")
-                    logger.info(f"✅ Signal yuborildi: {signal_type}")
-                else:
-                    logger.info(f"🔍 {active_symbol} tahlil qilindi: Signal yo'q (RSI: {rsi:.1f})")
-            else:
-                logger.error("❌ Birja bilan aloqa yo'q!")
+            res = await elite_analyser()
+            if res:
+                await app.bot.send_message(chat_id=CHANNEL_ID, text=res, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
-            logger.error(f"Loop xatosi: {e}")
-        
-        await asyncio.sleep(60) # Har 1 daqiqada tekshiradi
+            print(f"Loop xatosi: {e}")
+        await asyncio.sleep(WAIT_TIME)
 
 async def main():
-    # drop_pending_updates=True eski tiqilib qolgan xabarlarni tozalaydi
-    app = ApplicationBuilder().token(TOKEN).build()
-    
+    # drop_pending_updates=True Conflict xatosini oldini oladi
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     await app.initialize()
     await app.start()
     
-    logger.info("Bot Telegramga muvaffaqiyatli ulandi!")
-    
-    # Bir vaqtda ham xabarlarni kutadi, ham tahlil qiladi
+    # Ham pollingni, ham tahlil loopini birga ishga tushiramiz
     await asyncio.gather(
         app.updater.start_polling(drop_pending_updates=True),
         loop(app)
     )
 
 if __name__ == "__main__":
-    keep_alive()
+    keep_alive() # Veb-serverni alohida thread'da yoqish
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+    
