@@ -25,6 +25,7 @@ def home():
     return "✅ Bot is active and running!"
 
 def run_server():
+    # Render avtomatik port beradi, bo'lmasa 8080
     port = int(os.environ.get("PORT", 8080))
     server.run(host='0.0.0.0', port=port)
 
@@ -33,51 +34,49 @@ def keep_alive():
     t.start()
 
 # ==================== KONFIGURATSIYA ====================
+# Tokenni Render panelida 'Environment Variables'ga qo'shgan bo'lsangiz os.environ orqali oladi
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8397450809:AAHMf2JdIlnH4yP3kfaDDtuMRFtXD9Zcrys")
-CHANNEL_ID     = os.environ.get("CHANNEL_ID", "@fhoveuss")
-SYMBOL         = "XAU/USDT"
-TIMEFRAME      = "15m"       # Tahlil qilinadigan vaqt oralig'i
-WAIT_TIME      = 20          # Signallar orasidagi kutish vaqti (soniya)
-CANDLE_LIMIT   = 100         # Yuklanadigan shamlar soni
+CHANNEL_ID     = "@fhoveuss"
+SYMBOL         = "XAUUSDT" # Bybit uchun format
+TIMEFRAME      = "15m"     
+WAIT_TIME      = 60        # Birja bloklamasligi uchun 60 soniya tavsiya etiladi
+CANDLE_LIMIT   = 100       
 
-# ==================== CCXT BIRJA ====================
-exchange = ccxt.binance({
-    'options': {'defaultType': 'future'},
+# ==================== CCXT BYBIT (Binance o'rniga) ====================
+# Bybit Render serverlari joylashgan hududlarda (AQSH/Yevropa) yaxshi ishlaydi
+exchange = ccxt.bybit({
+    'options': {'defaultType': 'linear'},
     'enableRateLimit': True,
 })
 
 # ==================== MA'LUMOT OLISH ====================
 def get_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """Birjadan OHLCV ma'lumotlarini oladi."""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        if not ohlcv:
+            return pd.DataFrame()
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         return df
     except Exception as e:
-        logger.error(f"Ma'lumot olishda xato: {e}")
+        logger.error(f"Birjadan ma'lumot olishda xato: {e}")
         return pd.DataFrame()
 
 # ==================== TEXNIK TAHLIL ====================
 def elite_analyser(df: pd.DataFrame) -> dict:
-    """
-    RSI, EMA, MACD va Bollinger Bands asosida signal chiqaradi.
-    Qaytaradi: {'signal': 'BUY'|'SELL'|'WAIT', 'reason': str, 'price': float}
-    """
-    if df.empty or len(df) < 50:
-        return {'signal': 'WAIT', 'reason': 'Yetarli ma\'lumot yo\'q', 'price': 0}
+    # Ma'lumot yetarli emasligini tekshirish ('rsi' xatosini oldini oladi)
+    if df is None or df.empty or len(df) < 50:
+        return {'signal': 'WAIT', 'reason': 'Yetarli ma\'lumot yo\'q', 'price': 0, 'rsi': 50, 'ema20': 0, 'ema50': 0, 'bb_upper': 0, 'bb_lower': 0}
 
     close = df['close']
-    high  = df['high']
-    low   = df['low']
 
     # --- Indikatorlar ---
-    rsi   = ta.momentum.RSIIndicator(close, window=14).rsi()
-    ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator()
-    ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator()
-    macd  = ta.trend.MACD(close)
-    bb    = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+    rsi    = ta.momentum.RSIIndicator(close, window=14).rsi()
+    ema20  = ta.trend.EMAIndicator(close, window=20).ema_indicator()
+    ema50  = ta.trend.EMAIndicator(close, window=50).ema_indicator()
+    macd   = ta.trend.MACD(close)
+    bb     = ta.volatility.BollingerBands(close, window=20, window_dev=2)
 
     # Oxirgi qiymatlar
     last_rsi    = rsi.iloc[-1]
@@ -93,7 +92,6 @@ def elite_analyser(df: pd.DataFrame) -> dict:
     buy_score  = 0
     sell_score = 0
 
-    # RSI tekshiruvi
     if last_rsi < 35:
         buy_score += 2
         reasons.append(f"RSI oversold ({last_rsi:.1f})")
@@ -101,7 +99,6 @@ def elite_analyser(df: pd.DataFrame) -> dict:
         sell_score += 2
         reasons.append(f"RSI overbought ({last_rsi:.1f})")
 
-    # EMA kesishuvi
     if last_ema20 > last_ema50:
         buy_score += 1
         reasons.append("EMA20 > EMA50 (uptrend)")
@@ -109,7 +106,6 @@ def elite_analyser(df: pd.DataFrame) -> dict:
         sell_score += 1
         reasons.append("EMA20 < EMA50 (downtrend)")
 
-    # MACD
     if macd_line > signal_line:
         buy_score += 1
         reasons.append("MACD bullish")
@@ -117,7 +113,6 @@ def elite_analyser(df: pd.DataFrame) -> dict:
         sell_score += 1
         reasons.append("MACD bearish")
 
-    # Bollinger Bands
     if last_close <= bb_lower:
         buy_score += 2
         reasons.append("Narx BB pastki chegarasida")
@@ -125,7 +120,6 @@ def elite_analyser(df: pd.DataFrame) -> dict:
         sell_score += 2
         reasons.append("Narx BB yuqori chegarasida")
 
-    # Signal qaror
     if buy_score >= 4:
         signal = 'BUY'
     elif sell_score >= 4:
@@ -146,83 +140,45 @@ def elite_analyser(df: pd.DataFrame) -> dict:
 
 # ==================== FVG TOPISH ====================
 def find_fvg(df: pd.DataFrame) -> list:
-    """
-    Fair Value Gap (FVG) larni topadi.
-    Qaytaradi: [{'type': 'bullish'|'bearish', 'top': float, 'bottom': float, 'time': str}]
-    """
     fvgs = []
-    if len(df) < 3:
+    if df is None or df.empty or len(df) < 3:
         return fvgs
 
     for i in range(1, len(df) - 1):
         prev_high  = df['high'].iloc[i - 1]
         prev_low   = df['low'].iloc[i - 1]
-        curr_high  = df['high'].iloc[i]
-        curr_low   = df['low'].iloc[i]
         next_high  = df['high'].iloc[i + 1]
         next_low   = df['low'].iloc[i + 1]
-        time_label = str(df.index[i])
 
-        # Bullish FVG: avvalgi sham yuqori < keyingi sham past
         if prev_high < next_low:
-            fvgs.append({
-                'type':   'bullish',
-                'top':    next_low,
-                'bottom': prev_high,
-                'time':   time_label,
-            })
-
-        # Bearish FVG: avvalgi sham past > keyingi sham yuqori
+            fvgs.append({'type': 'bullish', 'top': next_low, 'bottom': prev_high})
         elif prev_low > next_high:
-            fvgs.append({
-                'type':   'bearish',
-                'top':    prev_low,
-                'bottom': next_high,
-                'time':   time_label,
-            })
+            fvgs.append({'type': 'bearish', 'top': prev_low, 'bottom': next_high})
 
-    # Faqat oxirgi 3 ta FVG qaytariladi
     return fvgs[-3:] if fvgs else []
 
 # ==================== XABAR FORMATLASH ====================
 def format_signal_message(analysis: dict, fvgs: list) -> str:
     signal = analysis['signal']
+    if signal == 'WAIT': return ""
 
-    if signal == 'BUY':
-        emoji  = "🟢"
-        action = "LONG / BUY"
-    elif signal == 'SELL':
-        emoji  = "🔴"
-        action = "SHORT / SELL"
-    else:
-        return ""   # WAIT signali kanalga yubormaydi
-
-    price     = analysis['price']
-    tp1       = price * 1.005 if signal == 'BUY' else price * 0.995
-    tp2       = price * 1.010 if signal == 'BUY' else price * 0.990
-    sl        = price * 0.995 if signal == 'BUY' else price * 1.005
-
-    fvg_text = ""
-    if fvgs:
-        fvg_lines = []
-        for f in fvgs:
-            fvg_lines.append(
-                f"  • {f['type'].upper()} FVG: {f['bottom']:.2f} – {f['top']:.2f}"
-            )
-        fvg_text = "\n\n📦 *Fair Value Gaps:*\n" + "\n".join(fvg_lines)
+    emoji  = "🟢" if signal == 'BUY' else "🔴"
+    action = "LONG / BUY" if signal == 'BUY' else "SHORT / SELL"
+    price  = analysis['price']
+    
+    tp1 = price * 1.005 if signal == 'BUY' else price * 0.995
+    tp2 = price * 1.010 if signal == 'BUY' else price * 0.990
+    sl  = price * 0.992 if signal == 'BUY' else price * 1.008
 
     msg = (
         f"{emoji} *{SYMBOL} — {action} SIGNAL*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *Narx:* `{price:.2f}`\n"
+        f"💰 *Kirish:* `{price:.2f}`\n"
         f"🎯 *TP1:* `{tp1:.2f}`\n"
         f"🎯 *TP2:* `{tp2:.2f}`\n"
-        f"🛑 *SL:*  `{sl:.2f}`\n\n"
-        f"📊 *RSI:* `{analysis['rsi']:.1f}` | "
-        f"*EMA20:* `{analysis['ema20']:.2f}` | "
-        f"*EMA50:* `{analysis['ema50']:.2f}`\n\n"
-        f"📝 *Sabab:* _{analysis['reason']}_"
-        f"{fvg_text}\n"
+        f"🛑 *SL:* `{sl:.2f}`\n\n"
+        f"📊 *RSI:* `{analysis['rsi']:.1f}`\n"
+        f"📝 *Sabab:* _{analysis['reason']}_\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"⏱ Timeframe: `{TIMEFRAME}`"
     )
@@ -230,71 +186,45 @@ def format_signal_message(analysis: dict, fvgs: list) -> str:
 
 # ==================== ASOSIY LOOP ====================
 async def loop(app):
-    """Har WAIT_TIME soniyada bozorni tahlil qilib signal yuboradi."""
     logger.info("Tahlil loop boshlandi...")
     while True:
         try:
-            df       = get_ohlcv(SYMBOL, TIMEFRAME, CANDLE_LIMIT)
-            analysis = elite_analyser(df)
-            fvgs     = find_fvg(df)
-            msg      = format_signal_message(analysis, fvgs)
+            df = get_ohlcv(SYMBOL, TIMEFRAME, CANDLE_LIMIT)
+            if not df.empty:
+                analysis = elite_analyser(df)
+                fvgs     = find_fvg(df)
+                msg      = format_signal_message(analysis, fvgs)
 
-            if msg:
-                await app.bot.send_message(
-                    chat_id    = CHANNEL_ID,
-                    text       = msg,
-                    parse_mode = ParseMode.MARKDOWN,
-                )
-                logger.info(f"Signal yuborildi: {analysis['signal']} @ {analysis['price']:.2f}")
-            else:
-                logger.info(f"Signal yo'q (WAIT). RSI={analysis['rsi']:.1f}")
-
+                if msg:
+                    await app.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"Signal yuborildi: {analysis['signal']}")
+                else:
+                    logger.info(f"Tahlil qilindi: Signal yo'q (WAIT). RSI={analysis['rsi']:.1f}")
         except Exception as e:
-            logger.error(f"Loop xatosi: {e}")
+            logger.error(f"Loop ichida xato: {e}")
 
         await asyncio.sleep(WAIT_TIME)
-
-# ==================== TELEGRAM BUYRUQLARI ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *XAU/USDT Tahlil Boti*\n\n"
-        "Bot faol! U har 20 soniyada bozorni tahlil qilib,\n"
-        f"kanalga signal yuboradi: {CHANNEL_ID}\n\n"
-        "📊 Indikatorlar: RSI, EMA, MACD, Bollinger Bands, FVG",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Joriy bozor holati."""
-    df       = get_ohlcv(SYMBOL, TIMEFRAME, 10)
-    analysis = elite_analyser(df)
-    await update.message.reply_text(
-        f"📊 *Joriy holat — {SYMBOL}*\n"
-        f"Narx: `{analysis['price']:.2f}`\n"
-        f"Signal: `{analysis['signal']}`\n"
-        f"RSI: `{analysis['rsi']:.1f}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
 
 # ==================== MAIN ====================
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("status", status))
+    
+    # Start buyrug'i
+    async def start(update, context):
+        await update.message.reply_text(f"🚀 Bot ishga tushdi! {SYMBOL} tahlil qilinmoqda...")
+    
+    app.add_handler(CommandHandler("start", start))
 
     await app.initialize()
     await app.start()
-    logger.info("Bot ishga tushdi!")
-
+    
     await asyncio.gather(
         app.updater.start_polling(drop_pending_updates=True),
-        loop(app),
+        loop(app)
     )
 
 if __name__ == "__main__":
-    keep_alive()
-    logger.info("Web-server ishga tushdi!")
+    keep_alive() # Render o'chirib yubormasligi uchun
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
