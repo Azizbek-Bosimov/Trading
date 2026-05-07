@@ -22,7 +22,7 @@ server = Flask('')
 
 @server.route('/')
 def home():
-    return "✅ Bot is active and running!"
+    return "✅ Bot ishlamoqda!"
 
 def run_server():
     port = int(os.environ.get("PORT", 8080))
@@ -35,22 +35,21 @@ def keep_alive():
 # ==================== KONFIGURATSIYA ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8397450809:AAHMf2JdIlnH4yP3kfaDDtuMRFtXD9Zcrys")
 CHANNEL_ID     = "@fhoveuss"
-SYMBOL         = "XAUUSDT" 
+# MEXC spot bozorida oltin narxi PAXG/USDT juftligida yuradi
+SYMBOL         = "PAXG/USDT" 
 TIMEFRAME      = "15m"     
-WAIT_TIME      = 60        # MEXC bloklamasligi uchun 1 daqiqa ideal
+WAIT_TIME      = 60        
 CANDLE_LIMIT   = 100       
 
-# ==================== CCXT MEXC (Eng kam cheklovli) ====================
+# ==================== CCXT MEXC ====================
 exchange = ccxt.mexc({
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'} 
+    'options': {'defaultType': 'spot'}
 })
 
 # ==================== MA'LUMOT OLISH ====================
 def get_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     try:
-        # MEXC ba'zan spotda 'XAU/USDT' yoki 'PAXG/USDT' ishlatadi
-        # Agar XAUUSDT ishlamasa, PAXGUSDT (oltin peg) ko'rib chiqiladi
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         if not ohlcv:
             return pd.DataFrame()
@@ -59,15 +58,17 @@ def get_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         df.set_index('timestamp', inplace=True)
         return df
     except Exception as e:
-        logger.error(f"MEXC dan ma'lumot olishda xato: {e}")
+        logger.error(f"Birjadan ma'lumot olishda xato: {e}")
         return pd.DataFrame()
 
-# ==================== TEXNIK TAHLIL ====================
+# ==================== TEXNIK TAHLIL (MEXC MOSLASH) ====================
 def elite_analyser(df: pd.DataFrame) -> dict:
     if df is None or df.empty or len(df) < 30:
         return {'signal': 'WAIT', 'reason': 'Yetarli ma\'lumot yo\'q', 'price': 0, 'rsi': 50}
 
     close = df['close']
+    
+    # Indikatorlar
     rsi    = ta.momentum.RSIIndicator(close, window=14).rsi()
     ema20  = ta.trend.EMAIndicator(close, window=20).ema_indicator()
     ema50  = ta.trend.EMAIndicator(close, window=50).ema_indicator()
@@ -80,33 +81,31 @@ def elite_analyser(df: pd.DataFrame) -> dict:
     bb_upper    = bb.bollinger_hband().iloc[-1]
     bb_lower    = bb.bollinger_lband().iloc[-1]
 
-    reasons = []
     buy_score  = 0
     sell_score = 0
+    reasons = []
 
-    # RSI Shartlari (Biroz yumshatildi: 40/60)
+    # Strategiya shartlari
     if last_rsi < 40:
         buy_score += 2
-        reasons.append(f"RSI past ({last_rsi:.1f})")
+        reasons.append(f"RSI oversold ({last_rsi:.1f})")
     elif last_rsi > 60:
         sell_score += 2
-        reasons.append(f"RSI baland ({last_rsi:.1f})")
+        reasons.append(f"RSI overbought ({last_rsi:.1f})")
 
-    # Trend
     if last_ema20 > last_ema50:
         buy_score += 1
     else:
         sell_score += 1
 
-    # Bollinger
     if last_close <= bb_lower:
         buy_score += 2
-        reasons.append("Narx BB pastida")
+        reasons.append("BB pastki chizig'ida")
     elif last_close >= bb_upper:
         sell_score += 2
-        reasons.append("Narx BB tepasida")
+        reasons.append("BB yuqori chizig'ida")
 
-    # Signal qarori
+    # Yakuniy signal
     if buy_score >= 3:
         signal = 'BUY'
     elif sell_score >= 3:
@@ -118,9 +117,7 @@ def elite_analyser(df: pd.DataFrame) -> dict:
         'signal': signal,
         'reason': ' | '.join(reasons),
         'price': last_close,
-        'rsi': last_rsi,
-        'ema20': last_ema20,
-        'ema50': last_ema50
+        'rsi': last_rsi
     }
 
 # ==================== ASOSIY LOOP ====================
@@ -137,37 +134,45 @@ async def loop(app):
                     emoji = "🟢" if analysis['signal'] == 'BUY' else "🔴"
                     msg = (
                         f"{emoji} *{SYMBOL} SIGNAL*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
                         f"💰 Narx: `{price:.2f}`\n"
                         f"📊 RSI: `{analysis['rsi']:.1f}`\n"
-                        f"📝 Sabab: {analysis['reason']}\n"
-                        f"⏱ Timeframe: {TIMEFRAME}"
+                        f"📝 Sabab: _{analysis['reason']}_\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⏱ Timeframe: `{TIMEFRAME}`"
                     )
                     await app.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
                     logger.info(f"Signal yuborildi: {analysis['signal']}")
                 else:
-                    logger.info(f"Signal yo'q. RSI: {analysis['rsi']:.1f}")
+                    logger.info(f"Kutilmoqda... RSI: {analysis['rsi']:.1f}")
         except Exception as e:
             logger.error(f"Loop xatosi: {e}")
         
         await asyncio.sleep(WAIT_TIME)
 
+# ==================== START BUYRUG'I ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🚀 Bot ishga tushdi!\nKanal: {CHANNEL_ID}\nJuftlik: {SYMBOL}")
+
 # ==================== MAIN ====================
 async def main():
-    # Conflict xatosini kamaytirish uchun application yaratish
+    # 409 Conflict xatosini oldini olish uchun pollingni tozalab boshlash
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
 
     await app.initialize()
     await app.start()
     
-    # Faqat bir marta loop va pollingni ishga tushirish
+    logger.info("Bot Telegramga ulandi.")
+    
     await asyncio.gather(
         app.updater.start_polling(drop_pending_updates=True),
         loop(app)
     )
 
 if __name__ == "__main__":
-    keep_alive()
+    keep_alive() # Render uyg'oq turishi uchun
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
+        logger.info("Bot to'xtatildi.")
