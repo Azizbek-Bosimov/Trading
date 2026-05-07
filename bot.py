@@ -7,172 +7,100 @@ import ccxt
 import pandas as pd
 import ta
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler
 
 # ==================== LOGGING ====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== RENDER UCHUN VEB-SERVER ====================
+# ==================== SERVER (Render o'chmasligi uchun) ====================
 server = Flask('')
-
 @server.route('/')
-def home():
-    return "✅ Bot ishlamoqda!"
+def home(): return "🤖 Bot is running..."
+def run(): server.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+def keep_alive(): Thread(target=run, daemon=True).start()
 
-def run_server():
-    port = int(os.environ.get("PORT", 8080))
-    server.run(host='0.0.0.0', port=port)
+# ==================== CONFIG ====================
+# Siz bergan yangi token:
+TOKEN = "8397450809:AAFtv0n6D1StMLmqeNb1EeKqHOnznVvcXpk"
+CHANNEL = "@fhoveuss"
 
-def keep_alive():
-    t = Thread(target=run_server, daemon=True)
-    t.start()
+# MEXC'da oltin formatlari har xil bo'lishi mumkin, hammasini tekshiramiz
+POSSIBLE_SYMBOLS = ["PAXG/USDT", "PAXGUSDT", "XAU_USDT"]
 
-# ==================== KONFIGURATSIYA ====================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8397450809:AAHMf2JdIlnH4yP3kfaDDtuMRFtXD9Zcrys")
-CHANNEL_ID     = "@fhoveuss"
-# MEXC spot bozorida oltin narxi PAXG/USDT juftligida yuradi
-SYMBOL         = "PAXG/USDT" 
-TIMEFRAME      = "15m"     
-WAIT_TIME      = 60        
-CANDLE_LIMIT   = 100       
+exchange = ccxt.mexc({'enableRateLimit': True})
 
-# ==================== CCXT MEXC ====================
-exchange = ccxt.mexc({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
+def get_data():
+    """Birjadan to'g'ri simvolni topib ma'lumot oladi"""
+    for sym in POSSIBLE_SYMBOLS:
+        try:
+            ohlcv = exchange.fetch_ohlcv(sym, "15m", limit=100)
+            if ohlcv:
+                df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+                return df, sym
+        except Exception:
+            continue
+    return None, None
 
-# ==================== MA'LUMOT OLISH ====================
-def get_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        if not ohlcv:
-            return pd.DataFrame()
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        return df
-    except Exception as e:
-        logger.error(f"Birjadan ma'lumot olishda xato: {e}")
-        return pd.DataFrame()
-
-# ==================== TEXNIK TAHLIL (MEXC MOSLASH) ====================
-def elite_analyser(df: pd.DataFrame) -> dict:
-    if df is None or df.empty or len(df) < 30:
-        return {'signal': 'WAIT', 'reason': 'Yetarli ma\'lumot yo\'q', 'price': 0, 'rsi': 50}
-
-    close = df['close']
-    
-    # Indikatorlar
-    rsi    = ta.momentum.RSIIndicator(close, window=14).rsi()
-    ema20  = ta.trend.EMAIndicator(close, window=20).ema_indicator()
-    ema50  = ta.trend.EMAIndicator(close, window=50).ema_indicator()
-    bb     = ta.volatility.BollingerBands(close, window=20, window_dev=2)
-
-    last_rsi    = rsi.iloc[-1]
-    last_close  = close.iloc[-1]
-    last_ema20  = ema20.iloc[-1]
-    last_ema50  = ema50.iloc[-1]
-    bb_upper    = bb.bollinger_hband().iloc[-1]
-    bb_lower    = bb.bollinger_lband().iloc[-1]
-
-    buy_score  = 0
-    sell_score = 0
-    reasons = []
-
-    # Strategiya shartlari
-    if last_rsi < 40:
-        buy_score += 2
-        reasons.append(f"RSI oversold ({last_rsi:.1f})")
-    elif last_rsi > 60:
-        sell_score += 2
-        reasons.append(f"RSI overbought ({last_rsi:.1f})")
-
-    if last_ema20 > last_ema50:
-        buy_score += 1
-    else:
-        sell_score += 1
-
-    if last_close <= bb_lower:
-        buy_score += 2
-        reasons.append("BB pastki chizig'ida")
-    elif last_close >= bb_upper:
-        sell_score += 2
-        reasons.append("BB yuqori chizig'ida")
-
-    # Yakuniy signal
-    if buy_score >= 3:
-        signal = 'BUY'
-    elif sell_score >= 3:
-        signal = 'SELL'
-    else:
-        signal = 'WAIT'
-
-    return {
-        'signal': signal,
-        'reason': ' | '.join(reasons),
-        'price': last_close,
-        'rsi': last_rsi
-    }
-
-# ==================== ASOSIY LOOP ====================
 async def loop(app):
-    logger.info("Tahlil loop boshlandi...")
+    logger.info("Tahlil boshlandi...")
     while True:
         try:
-            df = get_ohlcv(SYMBOL, TIMEFRAME, CANDLE_LIMIT)
-            if not df.empty:
-                analysis = elite_analyser(df)
+            df, active_symbol = get_data()
+            if df is not None:
+                close = df['c']
+                # Indikatorlar
+                rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+                ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1]
+                ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
+                price = close.iloc[-1]
                 
-                if analysis['signal'] != 'WAIT':
-                    price = analysis['price']
-                    emoji = "🟢" if analysis['signal'] == 'BUY' else "🔴"
+                # Signal shartlari (RSI + Trend)
+                signal_type = "WAIT"
+                if rsi < 38 and price > ema20: 
+                    signal_type = "BUY 🟢"
+                elif rsi > 62 and price < ema20: 
+                    signal_type = "SELL 🔴"
+                
+                if signal_type != "WAIT":
                     msg = (
-                        f"{emoji} *{SYMBOL} SIGNAL*\n"
+                        f"🚀 *{active_symbol} SIGNAL*\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
-                        f"💰 Narx: `{price:.2f}`\n"
-                        f"📊 RSI: `{analysis['rsi']:.1f}`\n"
-                        f"📝 Sabab: _{analysis['reason']}_\n"
+                        f"💰 Narx: `{price}`\n"
+                        f"📊 RSI: `{rsi:.1f}`\n"
+                        f"⚡️ Signal: *{signal_type}*\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
-                        f"⏱ Timeframe: `{TIMEFRAME}`"
+                        f"⏱ Timeframe: 15m"
                     )
-                    await app.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
-                    logger.info(f"Signal yuborildi: {analysis['signal']}")
+                    await app.bot.send_message(chat_id=CHANNEL, text=msg, parse_mode="Markdown")
+                    logger.info(f"✅ Signal yuborildi: {signal_type}")
                 else:
-                    logger.info(f"Kutilmoqda... RSI: {analysis['rsi']:.1f}")
+                    logger.info(f"🔍 {active_symbol} tahlil qilindi: Signal yo'q (RSI: {rsi:.1f})")
+            else:
+                logger.error("❌ Birja bilan aloqa yo'q!")
         except Exception as e:
             logger.error(f"Loop xatosi: {e}")
         
-        await asyncio.sleep(WAIT_TIME)
+        await asyncio.sleep(60) # Har 1 daqiqada tekshiradi
 
-# ==================== START BUYRUG'I ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🚀 Bot ishga tushdi!\nKanal: {CHANNEL_ID}\nJuftlik: {SYMBOL}")
-
-# ==================== MAIN ====================
 async def main():
-    # 409 Conflict xatosini oldini olish uchun pollingni tozalab boshlash
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-
+    # drop_pending_updates=True eski tiqilib qolgan xabarlarni tozalaydi
+    app = ApplicationBuilder().token(TOKEN).build()
+    
     await app.initialize()
     await app.start()
     
-    logger.info("Bot Telegramga ulandi.")
+    logger.info("Bot Telegramga muvaffaqiyatli ulandi!")
     
+    # Bir vaqtda ham xabarlarni kutadi, ham tahlil qiladi
     await asyncio.gather(
         app.updater.start_polling(drop_pending_updates=True),
         loop(app)
     )
 
 if __name__ == "__main__":
-    keep_alive() # Render uyg'oq turishi uchun
+    keep_alive()
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot to'xtatildi.")
+        pass
